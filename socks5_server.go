@@ -64,13 +64,21 @@ type SOCKS5Server struct {
 	sniPool    *StickyPool
 	naiveMgr   *NaiveManager
 	sessionMgr *SessionManager
+	// ssMgr -- клиент OwOSS (см. ss_manager.go). nil, если OwOSS не
+	// сконфигурирован (обычная работа только через naive, как раньше).
+	// Пока БЕЗ классификатора выбора протокола по региону/типу DPI (это
+	// отдельная, ещё не реализованная задача, см. память проекта) --
+	// если ssMgr задан, ВЕСЬ не-direct трафик идёт через него вместо
+	// naive, ровно так же, как изначально тестировался полный тоннель
+	// OwONaive до появления per-app классификации.
+	ssMgr *SSManager
 
 	mu          sync.RWMutex
 	activeConns map[string]*ConnStats
 	totalConns  int64
 }
 
-func NewSOCKS5Server(listenAddr string, token []byte, pool *StickyPool, naive *NaiveManager, session *SessionManager) *SOCKS5Server {
+func NewSOCKS5Server(listenAddr string, token []byte, pool *StickyPool, naive *NaiveManager, session *SessionManager, ssMgr *SSManager) *SOCKS5Server {
 	if len(token) == 0 {
 		log.Printf("[SOCKS5] WARNING: no auth token set — listener on %s accepts ANY local app, including ones excluded from the tunnel. This is the exact bypass class documented in amnezia-vpn/amnezia-client#2452 and #2457.", listenAddr)
 	}
@@ -80,6 +88,7 @@ func NewSOCKS5Server(listenAddr string, token []byte, pool *StickyPool, naive *N
 		sniPool:     pool,
 		naiveMgr:    naive,
 		sessionMgr:  session,
+		ssMgr:       ssMgr,
 		activeConns: make(map[string]*ConnStats),
 	}
 }
@@ -144,6 +153,36 @@ func (s *SOCKS5Server) handleConn(conn net.Conn) {
 
 	appType := ClassifyByHost(dst)
 	profile := profiles[appType]
+
+	// OwOSS-путь -- если сконфигурирован, забирает ВЕСЬ не-direct трафик
+	// (см. комментарий у поля ssMgr в структуре SOCKS5Server выше). Не
+	// трогает SNI-пул/naive вообще -- OwOSS не нуждается в decoy-SNI,
+	// он всегда ходит на свой собственный домен.
+	if s.ssMgr != nil {
+		upstream, err := s.ssMgr.Dial(dst, dstPort)
+		if err != nil {
+			log.Printf("[SOCKS5] [%s] OwOSS dial error: %v", connID, err)
+			s.writeReply(conn, repNetUnreachable, "0.0.0.0", 0)
+			return
+		}
+		defer upstream.Close()
+		if tc, ok := conn.(*net.TCPConn); ok {
+			tc.SetNoDelay(true)
+		}
+		if err := s.writeReply(conn, repSuccess, "0.0.0.0", 0); err != nil {
+			return
+		}
+		conn.SetDeadline(time.Time{})
+		// Разрешительный профиль -- НЕ profiles[appType]. MaxBytes/upload-ratio
+		// в pipe() существуют, чтобы decoy-SNI сессии naive выглядели как
+		// обычный браузинг (см. app_classifier.go) -- OwOSS не маскируется под
+		// декой вообще (свой честный домен), и не должен наследовать это
+		// ограничение по объёму. MaxBytes: 0 отключает всю эту проверку в
+		// pipe() целиком (см. `if profile.MaxBytes > 0` там).
+		s.pipe(conn, upstream, stats, SessionProfile{MaxBytes: 0})
+		return
+	}
+
 	sni := s.sniPool.PickForApp(appType)
 	log.Printf("[SOCKS5] [%s] app=%s sni=%s profile=min%ds", connID, appType, sni, profile.MinDuration)
 	go s.sessionMgr.preDNS(sni)

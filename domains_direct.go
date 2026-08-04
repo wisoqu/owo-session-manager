@@ -1,12 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -31,6 +36,13 @@ import (
 // Поэтому: если хост назначения совпадает с этим списком — прямое
 // соединение с устройства, минуя весь proxy-стек. SNI/маскировка вообще
 // не применяется, как и не должна.
+//
+// ВАЖНО: этот список НЕ читается из внешнего конфига и не может быть
+// изменён/отключён через additionalDirectDomains ниже — это осознанное
+// решение. Если бы safety-critical список банков/госуслуг можно было
+// перезаписать обычным конфиг-файлом, баг или атака на этот файл могли бы
+// тихо отключить защиту от MITM для чьей-то банковской сессии.
+// additionalDirectDomains — это ДОПОЛНЕНИЕ поверх, никогда не замена.
 var sensitiveDirectDomains = []string{
 	// Банки (подтверждено в whitelist.txt: sberbank.ru, tbank.ru, vtb.ru, alfabank.ru)
 	"sberbank.ru",
@@ -62,11 +74,78 @@ var sensitiveDirectDomains = []string{
 	"rzd.ru",          // РЖД — оплата билетов, паспортные данные при покупке
 }
 
+// additionalDirectDomains — пользовательские "В обход"-правила из
+// Flutter-клиента (раздельное туннелирование). В отличие от
+// sensitiveDirectDomains это не safety-критично, просто предпочтение
+// пользователя — поэтому можно грузить из файла и не хардкодить.
+//
+// Матчинг у IsDirectDomain уже суффиксный (host == d || HasSuffix(host,
+// "."+d)) — значит запись "ru" уже покрывает любой поддомен .ru без
+// специального wildcard-синтаксиса. Клиент может передать "*.ru" — здесь
+// просто срезаем ведущее "*." перед добавлением в список, дальше работает
+// та же суффиксная проверка, что и для обычных доменов.
+var (
+	additionalDirectDomains   []string
+	additionalDirectDomainsMu sync.RWMutex
+)
+
+// LoadAdditionalDirectDomains читает список из текстового файла (один домен
+// на строку, "#" — комментарий, пустые строки пропускаются). Отсутствие
+// файла — не ошибка (флаг мог быть не передан вообще, работаем только с
+// sensitiveDirectDomains), но ошибку чтения существующего файла возвращаем,
+// не глотаем молча.
+func LoadAdditionalDirectDomains(path string) error {
+	if path == "" {
+		return nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Printf("[direct-domains] файл %s не найден, используется только встроенный safety-список", path)
+			return nil
+		}
+		return fmt.Errorf("open %s: %w", path, err)
+	}
+	defer f.Close()
+
+	var loaded []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "*.")
+		loaded = append(loaded, strings.ToLower(line))
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+
+	additionalDirectDomainsMu.Lock()
+	additionalDirectDomains = loaded
+	additionalDirectDomainsMu.Unlock()
+
+	log.Printf("[direct-domains] загружено %d доменов из %s (поверх %d встроенных)",
+		len(loaded), path, len(sensitiveDirectDomains))
+	return nil
+}
+
 // IsDirectDomain проверяет, должен ли хост идти напрямую, минуя proxy/naive/SNI-pool.
 // Точное совпадение или поддомен (host == d || host оканчивается на "."+d).
+// Сначала всегда проверяется safety-critical список (sensitiveDirectDomains),
+// затем — пользовательские правила (additionalDirectDomains), если загружены.
 func IsDirectDomain(host string) bool {
 	host = strings.ToLower(host)
 	for _, d := range sensitiveDirectDomains {
+		if host == d || strings.HasSuffix(host, "."+d) {
+			return true
+		}
+	}
+
+	additionalDirectDomainsMu.RLock()
+	defer additionalDirectDomainsMu.RUnlock()
+	for _, d := range additionalDirectDomains {
 		if host == d || strings.HasSuffix(host, "."+d) {
 			return true
 		}

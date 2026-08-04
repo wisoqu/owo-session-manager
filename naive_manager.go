@@ -39,6 +39,11 @@ type NaiveManager struct {
 	// 11000+ был точно такой же открытой дверью, как 1080/1081 были
 	// раньше.
 	token        []byte
+	// signalPassword -- тот же пароль (в открытом виде, не hex), что на
+	// сервере лежит как hex-строка в secrets.json диспетчера. Пробрасывается
+	// в КАЖДЫЙ спавнимый naive-инстанс -- один и тот же пароль для всех SNI,
+	// раз это привязано к пользователю, а не к конкретному decoy-домену.
+	signalPassword []byte
 
 	mu        sync.Mutex
 	instances map[string]*naiveInstance
@@ -51,21 +56,30 @@ type naiveConfig struct {
 	Proxy           string `json:"proxy"`
 	RealitySNI      string `json:"reality-sni"`
 	RealityPublicKey string `json:"reality-public-key,omitempty"`
+	// SignalPassword -- пароль для owo_signal (см. owo_signal.go/owo_tls_front.go
+	// на стороне сервера, и патч 0003-client-signal-registration.patch на
+	// стороне этого самого naive-бинарника). Без этого поля naive не впишет
+	// сигнал в session_id ClientHello, и диспетчер на VPS всегда будет
+	// считать соединение непроверенным (сплайс на настоящий сайт вместо
+	// forward_proxy) -- см. чат: путь Б уже подтверждён живьём, это то,
+	// что нужно для проверки пути "валидный сигнал".
+	SignalPassword  string `json:"owo-signal-password,omitempty"`
 	Log             string `json:"log"`
 }
 
-func NewNaiveManager(naiveBin, upstreamURL, configDir string, basePort int, token []byte) (*NaiveManager, error) {
+func NewNaiveManager(naiveBin, upstreamURL, configDir string, basePort int, token []byte, signalPassword []byte) (*NaiveManager, error) {
 	if err := os.MkdirAll(configDir, 0700); err != nil {
 		return nil, fmt.Errorf("create config dir: %w", err)
 	}
 	return &NaiveManager{
-		naiveBin:    naiveBin,
-		upstreamURL: upstreamURL,
-		configDir:   configDir,
-		basePort:    basePort,
-		token:       token,
-		instances:   make(map[string]*naiveInstance),
-		portNext:    basePort,
+		naiveBin:       naiveBin,
+		upstreamURL:    upstreamURL,
+		configDir:      configDir,
+		basePort:       basePort,
+		token:          token,
+		signalPassword: signalPassword,
+		instances:      make(map[string]*naiveInstance),
+		portNext:       basePort,
 	}, nil
 }
 
@@ -156,10 +170,11 @@ func (m *NaiveManager) spawnWithApp(inst *naiveInstance) error {
 	}
 
 	cfg := naiveConfig{
-		Listen:     listenAddr,
-		Proxy:      proxyURL,
-		RealitySNI: inst.sni,
-		Log:        filepath.Join(m.configDir, fmt.Sprintf("naive_%s_%d.log", sanitize(inst.sni), inst.port)),
+		Listen:         listenAddr,
+		Proxy:          proxyURL,
+		RealitySNI:     inst.sni,
+		SignalPassword: string(m.signalPassword),
+		Log:            filepath.Join(m.configDir, fmt.Sprintf("naive_%s_%d.log", sanitize(inst.sni), inst.port)),
 	}
 
 	cfgBytes, err := json.MarshalIndent(cfg, "", "  ")

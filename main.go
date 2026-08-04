@@ -22,9 +22,14 @@ func main() {
 	configDir  := flag.String("cfgdir", "/tmp/owo-naive-cfgs", "Directory for per-SNI naive configs")
 	basePort   := flag.Int("baseport", 11000, "Starting port for naive instances")
 	socks5Token := flag.String("socks5-token", "", "Shared RFC1929 password for the local SOCKS5 listener. "+
-		"MUST match whatever the TUN client on this device is configured with. "+
-		"If empty, a random token is generated and printed once at startup — "+
-		"copy it into the client config before this process is trusted.")
+	"MUST match whatever the TUN client on this device is configured with. "+
+	"If empty, a random token is generated and printed once at startup — "+
+	"copy it into the client config before this process is trusted.")
+	signalPassword := flag.String("signal-password", "", "Per-user password for the owo_signal ClientHello "+
+	"signal. Must match (in plaintext -- the dispatcher's secrets.json stores the hex-encoded form of "+
+	"the SAME password) an entry known to the owo-dispatcher on the server side. Empty means naive "+
+	"won't embed any signal, and the dispatcher will always treat this client as unauthenticated "+
+	"(splice to the real decoy site instead of forward_proxy).")
 
 	// ── Флаги Relay режима ────────────────────────────────────────────────────
 	relay        := flag.Bool("relay", false, "Enable relay mode: accept incoming client connections")
@@ -36,6 +41,14 @@ func main() {
 	vkToken      := flag.String("vk-token", "", "VK API token for relay registry")
 	vkGroup      := flag.Int64("vk-group", 0, "VK Group ID for relay registry")
 	vkKey        := flag.String("vk-key", "", "Shared HMAC key matching bot SHARED_KEY")
+
+	// ── Флаги OwOSS ────────────────────────────────────────────────────────
+	// Пока без классификатора выбора протокола (см. комментарий у поля
+	// ssMgr в socks5_server.go) -- если --owoss-server задан, ВЕСЬ
+	// не-direct трафик идёт через OwOSS вместо naive.
+	owossServer := flag.String("owoss-server", "", "Публичный адрес owo-ss-front (host:port). Пусто = OwOSS отключён, работаем только через naive, как раньше.")
+	owossSNI    := flag.String("owoss-sni", "", "SNI/ServerName для OwOSS -- собственный домен сервера (напр. owocloud.online)")
+	owossPassword := flag.String("owoss-password", "", "Per-user пароль для OwOSS -- тот же, что в secrets.json на сервере")
 
 	flag.Parse()
 
@@ -78,7 +91,7 @@ func main() {
 	pool       := NewStickyPool(defaultPool)
 	sessionMgr := NewSessionManager()
 
-	naiveMgr, err := NewNaiveManager(*naiveBin, *upstream, *configDir, *basePort, token)
+	naiveMgr, err := NewNaiveManager(*naiveBin, *upstream, *configDir, *basePort, token, []byte(*signalPassword))
 	if err != nil {
 		log.Fatalf("[main] NaiveManager init: %v", err)
 	}
@@ -98,7 +111,17 @@ func main() {
 	StartCloudflareUpdater()
 
 	// ── SOCKS5 сервер ─────────────────────────────────────────────────────────
-	server := NewSOCKS5Server(*listenAddr, token, pool, naiveMgr, sessionMgr)
+	// ── OwOSS (опционально) ──────────────────────────────────────────────────
+	var ssMgr *SSManager
+	if *owossServer != "" {
+		if *owossSNI == "" || *owossPassword == "" {
+			log.Fatal("[main] --owoss-sni and --owoss-password are required when --owoss-server is set")
+		}
+		ssMgr = NewSSManager(*owossServer, *owossSNI, []byte(*owossPassword))
+		log.Printf("[main] OwOSS enabled: server=%s sni=%s (ALL non-direct traffic routes through OwOSS -- no per-app classifier yet)", *owossServer, *owossSNI)
+	}
+
+	server := NewSOCKS5Server(*listenAddr, token, pool, naiveMgr, sessionMgr, ssMgr)
 	go func() {
 		if err := server.ListenAndServe(); err != nil {
 			log.Fatalf("[main] SOCKS5: %v", err)
@@ -112,14 +135,14 @@ func main() {
 	if *relay {
 		// Валидация флагов
 		switch {
-		case *relayIP == "":
-			log.Fatal("[relay] --relay-ip required in relay mode")
-		case *vkToken == "":
-			log.Fatal("[relay] --vk-token required in relay mode")
-		case *vkGroup == 0:
-			log.Fatal("[relay] --vk-group required in relay mode")
-		case *vkKey == "":
-			log.Fatal("[relay] --vk-key required in relay mode")
+			case *relayIP == "":
+				log.Fatal("[relay] --relay-ip required in relay mode")
+			case *vkToken == "":
+				log.Fatal("[relay] --vk-token required in relay mode")
+			case *vkGroup == 0:
+				log.Fatal("[relay] --vk-group required in relay mode")
+			case *vkKey == "":
+				log.Fatal("[relay] --vk-key required in relay mode")
 		}
 
 		vkc = NewVKClient(*vkToken, *vkGroup, *vkKey, *relayIP, *relayPort, *relayPubkey, *relayKind)
@@ -152,7 +175,7 @@ func main() {
 		}()
 
 		log.Printf("[relay] active: public=%s:%d  internal=%s  kind=%s",
-			*relayIP, *relayPort, *relayListen, *relayKind)
+			   *relayIP, *relayPort, *relayListen, *relayKind)
 	}
 
 	// ── Status ticker ─────────────────────────────────────────────────────────
@@ -162,11 +185,11 @@ func main() {
 		for range t.C {
 			instances := naiveMgr.Status()
 			log.Printf("[status] active_conns=%d naive_instances=%d total_served=%d",
-				server.ActiveConns(), len(instances), server.totalConns)
+				   server.ActiveConns(), len(instances), server.totalConns)
 			for _, inst := range instances {
 				log.Printf("[status]   sni=%-25s port=%d ready=%v idle=%s",
-					inst.SNI, inst.Port, inst.Ready,
-					time.Since(inst.LastUsed).Round(time.Second))
+					   inst.SNI, inst.Port, inst.Ready,
+	       time.Since(inst.LastUsed).Round(time.Second))
 			}
 		}
 	}()
