@@ -30,6 +30,10 @@ func main() {
 	"the SAME password) an entry known to the owo-dispatcher on the server side. Empty means naive "+
 	"won't embed any signal, and the dispatcher will always treat this client as unauthenticated "+
 	"(splice to the real decoy site instead of forward_proxy).")
+	directDomainsFile := flag.String("direct-domains-file", "", "Путь к текстовому файлу с "+
+	"пользовательскими \"В обход\" доменами (один на строку, из Flutter-клиента, split tunneling). "+
+	"Пусто = работаем только со встроенным sensitiveDirectDomains списком, как раньше. См. "+
+	"LoadAdditionalDirectDomains в domains_direct.go -- это ДОПОЛНЕНИЕ, не замена safety-critical списка.")
 
 	// ── Флаги Relay режима ────────────────────────────────────────────────────
 	relay        := flag.Bool("relay", false, "Enable relay mode: accept incoming client connections")
@@ -54,6 +58,15 @@ func main() {
 
 	if *upstream == "" {
 		log.Fatal("[main] --upstream required: https://owo:pass@proxy.owocloud.online")
+	}
+
+	// [OwO] Пользовательские "В обход" домены из клиента -- см. domains_direct.go.
+	// Ошибку не проглатываем: если флаг передан, но файл битый/нечитаемый, это
+	// молчаливо откатило бы пользователя на поведение "как будто он не настраивал
+	// split tunneling вообще" -- лучше упасть явно при старте, чем незаметно
+	// проигнорировать чьи-то bypass-правила.
+	if err := LoadAdditionalDirectDomains(*directDomainsFile); err != nil {
+		log.Fatalf("[main] --direct-domains-file: %v", err)
 	}
 
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
